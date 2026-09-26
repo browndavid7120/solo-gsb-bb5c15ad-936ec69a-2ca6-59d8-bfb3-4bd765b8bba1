@@ -50,6 +50,8 @@ docker compose up --build
 
 - **端口**：`8000`（在 `docker-compose.yml` 的 `ports` 中修改）
 - 首次启动会自动加载内置示例标准地址（`sample_data/standard_addresses.csv`，共 15 条，含中英文地址）
+- **启动时自动执行数据库结构迁移**（见下文「数据库结构迁移」）：建表、缺列补齐与
+  历史数据回填全部在启动流程内完成，无需手工初始化
 - SQLite 数据库保存在 Docker volume `address-data`（容器内 `/data/addresses.db`），重启不丢失（A/B 实验记录与外部地址映射批次同样持久化在该库）
 - **必要配置**：开箱无需任何配置；`docker-compose.yml` 中的 `AUTO_THRESHOLD` / `MARGIN_THRESHOLD` /
   `REJECT_THRESHOLD` / `TOKEN_WEIGHT` 环境变量仅作为常规匹配的默认值与网页实验表单的预填值，
@@ -63,6 +65,24 @@ ADDRESS_DB_PATH=./data/addresses.db \
 SAMPLE_CSV=./sample_data/standard_addresses.csv \
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+---
+
+## 数据库结构迁移
+
+程序启动时（FastAPI lifespan → `app/db.py` 的 `init_db`）自动对 SQLite 数据库执行
+**有序版本迁移**，无需任何手工操作；Docker / Compose 一键启动已包含依赖安装与迁移。
+
+- **兼容新库与无版本旧库**：全新数据库依次建全部表与索引；无版本标记的旧库按版本
+  顺序补齐缺失列（`match_logs.consensus_json`、`selected_address_id`、
+  `selected_address_text`）并一次性回填复核地址快照，语义与迁移框架引入前完全一致；
+  已是最新的库直接跳过。
+- **单事务升级**：每次迁移的结构变更、数据回填与版本登记（`schema_migrations` 表）
+  在**同一个 SQLite 写事务**（`BEGIN IMMEDIATE`）内提交；任一步失败整体回滚并终止
+  启动，下次启动从原版本继续重跑，不会留下半截结构。
+- **并发安全**：取写锁后重读版本号——两个连接同时初始化同一数据库时，已完成的迁移
+  不会重复执行。
+- **版本保护**：库版本高于本程序支持的版本时拒绝启动，且不改动数据库。
 
 ---
 
@@ -870,7 +890,7 @@ curl -s 'http://localhost:8000/api/review-replay?category=conflict'
 ├── app/
 │   ├── main.py            # FastAPI 路由（网页 + REST API）
 │   ├── config.py          # 阈值/路径等环境变量配置
-│   ├── db.py              # SQLite 表结构与读写
+│   ├── db.py              # SQLite 表结构、有序版本迁移与读写
 │   ├── normalization.py   # Unicode/缩写/门牌号归一化与分词
 │   ├── matcher.py         # 词元与门牌号相似度、候选判定
 │   ├── experiments.py     # 规则 A/B 对照实验：逐档运行、差异分析与持久化；历史回归对比（对齐/分类/汇总）

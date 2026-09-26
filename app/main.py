@@ -48,8 +48,16 @@ _conn: db.sqlite3.Connection | None = None
 def get_conn() -> db.sqlite3.Connection:
     global _conn
     if _conn is None:
-        _conn = db.connect()
-        db.init_db(_conn)
+        conn = db.connect()
+        try:
+            db.init_db(conn)
+        except Exception:
+            # A failed migration (e.g. the database was migrated by a newer
+            # program version) must abort startup without leaving a
+            # half-initialised connection behind for later requests.
+            conn.close()
+            raise
+        _conn = conn
     return _conn
 
 
@@ -76,9 +84,12 @@ def settings_dep() -> Settings:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # get_conn() opens the shared connection and runs the ordered schema
+    # migrations; a failed migration (e.g. a database written by a newer
+    # program version) aborts startup before any request is served.
+    conn = get_conn()
     # Auto-load the bundled sample data on first run so the UI works
     # immediately with the documented one-line Docker command.
-    conn = get_conn()
     if db.count_addresses(conn) == 0:
         sample = Path(get_settings().sample_csv)
         if sample.exists():

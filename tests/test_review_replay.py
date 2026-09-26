@@ -345,8 +345,12 @@ def test_unknown_category_filter_and_summary(client):
 
 
 def test_old_database_backfills_snapshot_for_live_selection():
-    # init_db backfills the durable snapshot for legacy reviews whose chosen
-    # address still exists, so future deletions no longer lose the verdict.
+    # A database created before the review-snapshot feature (match_logs has
+    # neither the consensus nor the durable snapshot columns, and there is no
+    # schema-version registration): init_db's ordered migrations add the
+    # missing columns and backfill the durable snapshot for legacy reviews
+    # whose chosen address still exists, so future deletions no longer lose
+    # the verdict.
     import os
     import tempfile
     from pathlib import Path
@@ -362,20 +366,56 @@ def test_old_database_backfills_snapshot_for_live_selection():
     conn = None
     try:
         conn = db.connect()
-        db.init_db(conn)
+        # Pre-migration schema, written by hand: no schema_migrations table
+        # and a match_logs without consensus_json / selected_address_*.
+        conn.executescript(
+            """
+            CREATE TABLE addresses (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_text            TEXT NOT NULL,
+                tokens_json          TEXT NOT NULL,
+                street_tokens_json   TEXT NOT NULL DEFAULT '[]',
+                locality_tokens_json TEXT NOT NULL DEFAULT '[]',
+                house                TEXT,
+                line1                TEXT,
+                city                 TEXT,
+                state                TEXT,
+                postal_code          TEXT,
+                country              TEXT,
+                external_id          TEXT,
+                raw_json             TEXT NOT NULL,
+                created_at           TEXT NOT NULL
+            );
+            CREATE TABLE match_logs (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                query            TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                score            REAL,
+                selected_id      INTEGER REFERENCES addresses(id) ON DELETE SET NULL,
+                candidate_id     INTEGER REFERENCES addresses(id) ON DELETE SET NULL,
+                token_score      REAL,
+                house_score      REAL,
+                matched_tokens   TEXT,
+                conflicts        TEXT,
+                candidates_json  TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                reviewed_at      TEXT,
+                review_action    TEXT
+            );
+            """
+        )
         ingest_mod.add_many(
             conn, ingest_mod.parse_csv(Path(get_settings().sample_csv).read_bytes())
         )
-        # Insert a "legacy" reviewed log pointing at a live address without any
-        # snapshot columns populated.
+        # Insert a "legacy" reviewed log pointing at a live address; the
+        # snapshot columns do not even exist yet at this point.
         addr_id = conn.execute("SELECT MIN(id) FROM addresses").fetchone()[0]
         cur = conn.execute(
             """
             INSERT INTO match_logs
-                (query, status, score, selected_id, selected_address_id,
-                 selected_address_text, candidates_json, created_at,
-                 reviewed_at, review_action)
-            VALUES (?, 'reviewed', 0.72, ?, NULL, NULL, '[]', ?, ?, 'confirmed')
+                (query, status, score, selected_id, candidates_json,
+                 created_at, reviewed_at, review_action)
+            VALUES (?, 'reviewed', 0.72, ?, '[]', ?, ?, 'confirmed')
             """,
             ("legacy query", addr_id, "2020-01-01T00:00:00+00:00",
              "2020-01-01T00:00:00+00:00"),
@@ -385,7 +425,8 @@ def test_old_database_backfills_snapshot_for_live_selection():
         conn.close()
         conn = None
 
-        # Re-open: init_db runs the migration/backfill.
+        # Re-open: init_db migrates in order -- adds the missing columns,
+        # backfills the snapshot and registers the schema version.
         conn = db.connect()
         db.init_db(conn)
         row = conn.execute(
