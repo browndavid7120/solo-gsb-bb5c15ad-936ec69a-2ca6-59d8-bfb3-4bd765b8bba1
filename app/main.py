@@ -76,6 +76,9 @@ def settings_dep() -> Settings:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # get_conn() runs the ordered schema migrations (db.init_db) before the
+    # app starts serving; a failed migration or a too-new database version
+    # raises here and aborts startup without serving requests.
     # Auto-load the bundled sample data on first run so the UI works
     # immediately with the documented one-line Docker command.
     conn = get_conn()

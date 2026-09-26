@@ -135,12 +135,70 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA)
-    # Lightweight migrations for databases created before the column existed.
+# ---------------------------------------------------------------- migrations --
+#
+# Ordered, versioned schema migrations.  The database's current version lives
+# in ``PRAGMA user_version``; files created before versioning existed -- and
+# brand-new empty files -- report version 0.  ``init_db`` applies every pending
+# migration in order, each inside its own SQLite write transaction
+# (``BEGIN IMMEDIATE``) together with the version bump, so one failed step
+# rolls back completely (schema change + data backfill + version registration)
+# and aborts startup, while already-committed steps stay committed and the next
+# startup resumes from the last recorded version.
+
+
+class SchemaVersionError(RuntimeError):
+    """The database file belongs to a newer program version; startup refuses
+    to touch it rather than risk downgrading or misreading its schema."""
+
+
+def _user_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _set_user_version(conn: sqlite3.Connection, version: int) -> None:
+    # PRAGMA does not accept bound parameters; the version is always an int
+    # produced by this module, never user input.
+    conn.execute(f"PRAGMA user_version = {int(version)}")
+
+
+def _execute_statements(conn: sqlite3.Connection, script: str) -> None:
+    """Run a multi-statement script inside the caller's transaction.
+
+    ``Connection.executescript`` would implicitly COMMIT the open migration
+    transaction first, breaking the all-or-nothing guarantee, so the script is
+    split into complete statements and executed one by one instead.
+    """
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        conn.execute(statement)
+
+
+def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
+    """Create all tables and indexes (idempotent: ``IF NOT EXISTS``).
+
+    Fresh files get the full current schema here; legacy databases keep their
+    existing tables and have any missing columns added by the later steps.
+    """
+    _execute_statements(conn, SCHEMA)
+
+
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    """Add ``match_logs.consensus_json`` (review-consensus verdict at match
+    time) for databases created before the column existed."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(match_logs)")}
     if "consensus_json" not in cols:
         conn.execute("ALTER TABLE match_logs ADD COLUMN consensus_json TEXT")
+
+
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    """Add the durable review-choice snapshot columns and backfill them."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_logs)")}
     if "selected_address_id" not in cols:
         conn.execute("ALTER TABLE match_logs ADD COLUMN selected_address_id INTEGER")
     if "selected_address_text" not in cols:
@@ -150,23 +208,64 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Records whose chosen address was already deleted keep NULL snapshots and
     # are reported as "original choice unknown" by the replay -- never guessed
     # from the candidate list.
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_logs)")}
-    if "selected_address_id" in cols:
-        conn.execute(
-            """
-            UPDATE match_logs
-               SET selected_address_id = selected_id,
-                   selected_address_text = (
-                       SELECT a.full_text FROM addresses a
-                        WHERE a.id = match_logs.selected_id
-                   )
-             WHERE status = 'reviewed'
-               AND review_action IN ('confirmed', 'overridden')
-               AND selected_id IS NOT NULL
-               AND selected_address_id IS NULL
-            """
-        )
-    conn.commit()
+    conn.execute(
+        """
+        UPDATE match_logs
+           SET selected_address_id = selected_id,
+               selected_address_text = (
+                   SELECT a.full_text FROM addresses a
+                    WHERE a.id = match_logs.selected_id
+               )
+         WHERE status = 'reviewed'
+           AND review_action IN ('confirmed', 'overridden')
+           AND selected_id IS NOT NULL
+           AND selected_address_id IS NULL
+        """
+    )
+
+
+# Migrations in order: MIGRATIONS[v] upgrades the database from version v to
+# version v + 1.  Append a new function here for every future schema change.
+MIGRATIONS = (_migrate_0_to_1, _migrate_1_to_2, _migrate_2_to_3)
+
+# The highest database version this program understands.
+SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    """Bring the database schema up to ``SCHEMA_VERSION`` (ordered migrations).
+
+    Each pending migration runs in its own SQLite write transaction together
+    with its version registration; any failure rolls that step back entirely
+    and propagates, aborting startup -- a later startup re-runs from the last
+    committed version.  The version is always (re-)read after the write lock
+    is taken, so two connections initialising the same file concurrently
+    serialise on the lock and never re-execute a completed migration.  A
+    database whose recorded version is newer than this program supports is
+    left untouched and reported via :class:`SchemaVersionError`.
+    """
+    while True:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = _user_version(conn)
+            if version > SCHEMA_VERSION:
+                raise SchemaVersionError(
+                    f"数据库结构版本 {version} 高于本程序支持的版本 {SCHEMA_VERSION}，"
+                    "拒绝启动（数据库未被修改）；请使用更新版本的程序打开该库"
+                )
+            if version < 0:
+                raise SchemaVersionError(
+                    f"数据库结构版本非法（{version}），拒绝启动（数据库未被修改）"
+                )
+            if version == SCHEMA_VERSION:
+                conn.commit()
+                return
+            MIGRATIONS[version](conn)
+            _set_user_version(conn, version + 1)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 @contextmanager

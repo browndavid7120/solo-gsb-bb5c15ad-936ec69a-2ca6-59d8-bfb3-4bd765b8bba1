@@ -381,6 +381,9 @@ def test_old_database_backfills_snapshot_for_live_selection():
              "2020-01-01T00:00:00+00:00"),
         )
         log_id = cur.lastrowid
+        # Simulate a database last migrated before the snapshot migration
+        # (version 2 -> 3): the re-opened init_db re-runs the backfill step.
+        conn.execute("PRAGMA user_version = 2")
         conn.commit()
         conn.close()
         conn = None

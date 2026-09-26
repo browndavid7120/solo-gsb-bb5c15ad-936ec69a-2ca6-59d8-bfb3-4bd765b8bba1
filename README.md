@@ -55,6 +55,18 @@ docker compose up --build
   `REJECT_THRESHOLD` / `TOKEN_WEIGHT` 环境变量仅作为常规匹配的默认值与网页实验表单的预填值，
   A/B 实验中每档参数都可在请求里单独覆盖，无需重建镜像
 
+### 数据库结构版本迁移
+
+应用启动时自动执行**有序版本迁移**（版本号记录在 SQLite `PRAGMA user_version`），无需任何手工操作：
+
+- **新库**：直接建到当前最新结构版本；
+- **无版本旧库**（版本功能上线前创建的库）：按序补齐缺失的表与列（如 `consensus_json`、
+  复核所选地址快照列），并为快照功能上线前的已复核记录**一次性回填**所选地址 ID 与全文；
+- **每次升级都在同一个 SQLite 写事务**（`BEGIN IMMEDIATE`）内完成结构变更、数据回填与版本登记：
+  任一步失败则该步**整体回滚**并终止启动，再次启动从已登记的版本继续重跑，已完成步骤不会重复；
+- **多实例同时初始化同一库**时，各自取写锁后重读版本，已完成的迁移不会重复执行；
+- **库版本高于程序支持的版本**时拒绝启动且不改动数据库（请换用更新版本的程序）。
+
 不用 Docker 时：
 
 ```bash
@@ -870,7 +882,7 @@ curl -s 'http://localhost:8000/api/review-replay?category=conflict'
 ├── app/
 │   ├── main.py            # FastAPI 路由（网页 + REST API）
 │   ├── config.py          # 阈值/路径等环境变量配置
-│   ├── db.py              # SQLite 表结构与读写
+│   ├── db.py              # SQLite 表结构、有序版本迁移（user_version）与读写
 │   ├── normalization.py   # Unicode/缩写/门牌号归一化与分词
 │   ├── matcher.py         # 词元与门牌号相似度、候选判定
 │   ├── experiments.py     # 规则 A/B 对照实验：逐档运行、差异分析与持久化；历史回归对比（对齐/分类/汇总）
